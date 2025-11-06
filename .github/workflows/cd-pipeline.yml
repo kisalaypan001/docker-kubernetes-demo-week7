@@ -18,6 +18,12 @@ env:
   GAR_LOCATION: us-central1               # <-- IMPORTANT: Verify this matches your AR region
   IMAGE_NAME: iris-api
   K8S_DEPLOYMENT_NAME: iris-api-deployment # <-- Must match the 'name' in k8s/deployment.yaml
+  
+  # Stress Test Parameters for Scenario 1 (Scaling allowed)
+  WRK_THREADS: 10
+  WRK_CONNECTIONS: 200
+  WRK_DURATION: 30s
+  WRK_PAYLOAD: '{"sepal_length": 5.1, "sepal_width": 3.5, "petal_length": 1.4, "petal_width": 0.2}'
 
 jobs:
   build-push-deploy:
@@ -28,7 +34,7 @@ jobs:
       - name: ⬇️ Checkout Repository
         uses: actions/checkout@v4
 
-      # 1. Authenticate to Google Cloud using the Service Account Key Secret
+      # 1. Authenticate to Google Cloud
       - id: 'auth'
         name: '🔑 Authenticate to Google Cloud'
         uses: 'google-github-actions/auth@v2'
@@ -57,19 +63,67 @@ jobs:
           cluster_name: ${{ env.GKE_CLUSTER }}
           location: ${{ env.GKE_LOCATION }}
 
-      # 5. Deploy to Kubernetes
-      - name: '🚢 Deploy new image version to GKE'
+      # 5. Deploy to Kubernetes (Apply all manifests)
+      - name: '🚢 Deploy new image version and HPA to GKE'
         run: |
-          # FIX 1: Apply the DEPLOYMENT manifest first to ensure the object exists.
-          # The 'kubectl apply' command handles creation (first run) and updates (subsequent runs).
+          # Apply DEPLOYMENT manifest (ensures deployment object exists)
           kubectl apply -f k8s/deployment.yaml
           
-          # FIX 2: Apply the SERVICE manifest (needed for creation/updates)
+          # Apply SERVICE manifest (LoadBalancer)
           kubectl apply -f k8s/service.yaml
           
-          # Step to update the image tag on the existing deployment
+          # Apply HPA manifest (Horizontal Pod Autoscaler)
+          # IMPORTANT: Make sure k8s/hpa.yaml exists!
+          kubectl apply -f k8s/hpa.yaml
+          
+          # Update the image tag on the existing deployment
           kubectl set image deployment/${{ env.K8S_DEPLOYMENT_NAME }} \
             iris-api-container=${{ env.FULL_IMAGE_URI }}
             
-          # Wait for the deployment rollout
+          # Wait for the deployment rollout to complete before proceeding
           kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT_NAME }} --timeout=5m
+
+      # 6. Get LoadBalancer External IP
+      - name: '🌐 Get LoadBalancer External IP'
+        id: get_ip
+        run: |
+          IP=""
+          COUNTER=0
+          # Wait up to 5 minutes (15 checks) for the LoadBalancer IP
+          while [ -z "$IP" ] && [ $COUNTER -lt 15 ]; do
+            IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -z "$IP" ]; then
+              echo "Waiting for external IP..."
+              sleep 20
+              COUNTER=$((COUNTER + 1))
+            fi
+          done
+          
+          if [ -z "$IP" ]; then
+            echo "Error: LoadBalancer IP not found after 5 minutes."
+            exit 1
+          else
+            echo "External IP found: $IP"
+            echo "EXTERNAL_IP=$IP" >> $GITHUB_ENV # Set environment variable
+          fi
+
+      # 7. Stress Test Deployment (wrk)
+      - name: '💥 Stress Test Deployment'
+        if: success()
+        run: |
+          # Install wrk utility on the GitHub Actions runner
+          sudo apt-get update && sudo apt-get install -y wrk
+          
+          # Display current HPA status before test (for screencast proof)
+          echo "--- HPA Status Before Test ---"
+          kubectl get hpa
+          
+          # Execute the stress test against the /predict/ endpoint
+          echo "--- Running Stress Test with concurrency ${{ env.WRK_CONNECTIONS }} for ${{ env.WRK_DURATION }} ---"
+          wrk -t${{ env.WRK_THREADS }} -c${{ env.WRK_CONNECTIONS }} -d${{ env.WRK_DURATION }} --latency \
+            -s <(echo "function headers() return {[\"Content-Type\"] = \"application/json\"} end; function body() return \"${{ env.WRK_PAYLOAD }}\" end") \
+            http://${{ env.EXTERNAL_IP }}/predict/
+            
+          # Display HPA status after test (for screencast proof of scaling)
+          echo "--- HPA Status After Test ---"
+          kubectl get hpa
